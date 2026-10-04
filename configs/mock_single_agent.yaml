@@ -1,0 +1,19 @@
+experiment:
+  name: mock_single_agent
+
+dataset:
+  path: data/splits/dev.mock.jsonl
+
+strategy:
+  type: single_agent
+
+model:
+  provider: mock
+  name: mock-accurate
+  temperature: 0.0
+
+budget:
+  max_calls: 4
+  max_total_tokens: 8000
+
+seed: 42

@@ -1,0 +1,26 @@
+experiment:
+  name: phase7_mock_dev
+
+benchmark_version: collectiveeval-benchmark-v1
+
+dataset:
+  path: data/benchmark_v1/dev.jsonl
+
+strategy:
+  type: single_agent
+
+model:
+  provider: mock
+  name: mock-accurate
+  mock_mode: gold_fixture
+  temperature: 0.0
+
+budget_tier: small
+budget_policy:
+  mode: MATCHED_TOKENS
+
+budget:
+  max_calls: 2
+  max_total_tokens: 4000
+
+seed: 42

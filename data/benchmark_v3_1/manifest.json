@@ -1,0 +1,34 @@
+{
+  "counts": {
+    "difficulty": {
+      "easy": 144,
+      "hard": 192,
+      "medium": 144
+    },
+    "split": {
+      "dev": 280,
+      "test": 200
+    },
+    "task_type": {
+      "business_summarization": 120,
+      "grounded_qa": 120,
+      "robustness": 120,
+      "structured_extraction": 120
+    }
+  },
+  "created_at": "2026-10-03T11:03:47.235182+00:00",
+  "files": {
+    "dev.jsonl": {
+      "examples": 280,
+      "sha256": "4c2779b9daae1a6e5c6d22677a9825f6ea7b7d6e00ac5b360e87e02e6547d622"
+    },
+    "test.jsonl": {
+      "examples": 200,
+      "held_out": true,
+      "sha256": "0372cdb6389205a71db269327af5cbed6679ae2860235b806fbdcd1e3426fb7f"
+    }
+  },
+  "held_out_policy": "test split must not be used for training, tuning, or router fitting",
+  "manifest_payload_sha256": "5b728c1b2c3635857bbf8565cf76f8787e72280538dbb8667dbb4f521318dd27",
+  "version": "collectiveeval-benchmark-v3.1"
+}
