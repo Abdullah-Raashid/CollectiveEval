@@ -308,6 +308,9 @@ class StrategyContext:
                         {
                             "parse_error": str(parse_error),
                             "raw_output": original_response.raw_output,
+                            "failed_parsed_output": parse_error.parsed_output
+                            if parse_error.parsed_output is not None
+                            else original_response.content or None,
                         }
                     )
                 async with self._ledger_lock:
@@ -383,12 +386,16 @@ class StrategyContext:
             if "needs_revision" not in response.content or not isinstance(
                 response.content["needs_revision"], bool
             ):
-                raise OutputParseError("PARSE_ERROR: critic output requires boolean needs_revision")
+                raise OutputParseError(
+                    "PARSE_ERROR: critic output requires boolean needs_revision",
+                    parsed_output=response.content,
+                )
 
             issues = response.content.get("issues")
             if not isinstance(issues, list) or not all(isinstance(issue, str) for issue in issues):
                 raise OutputParseError(
-                    "PARSE_ERROR: critic output requires issues as an array of strings"
+                    "PARSE_ERROR: critic output requires issues as an array of strings",
+                    parsed_output=response.content,
                 )
 
             if response.raw_output is None:
@@ -399,7 +406,9 @@ class StrategyContext:
                 response.content, CRITIC_OUTPUT_SCHEMA, prefix="critic"
             )
             if schema_issues:
-                raise OutputParseError("PARSE_ERROR: " + "; ".join(schema_issues))
+                raise OutputParseError(
+                    "PARSE_ERROR: " + "; ".join(schema_issues), parsed_output=response.content
+                )
         elif response.raw_output and not response.content:
             parsed = parse_provider_output(
                 request.example,

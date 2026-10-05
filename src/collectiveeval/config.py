@@ -26,12 +26,22 @@ def resolve_env_vars(value: Any) -> Any:
     return value
 
 
-def load_yaml_config(path: str | Path, *, resolve_env: bool = True) -> dict[str, Any]:
+def load_config(path: str | Path, *, resolve_env: bool = True) -> dict[str, Any]:
+    """Preserve JSON scalar types; retain YAML support for existing configs."""
     with Path(path).open("r", encoding="utf-8") as handle:
-        payload = yaml.safe_load(handle) or {}
+        payload = (
+            json.load(handle) if Path(path).suffix.lower() == ".json" else yaml.safe_load(handle)
+        )
+    if payload is None:
+        payload = {}
     if not isinstance(payload, dict):
         raise ValueError("experiment config must be a mapping")
     return cast(dict[str, Any], resolve_env_vars(payload) if resolve_env else payload)
+
+
+def load_yaml_config(path: str | Path, *, resolve_env: bool = True) -> dict[str, Any]:
+    """Compatibility entry point; dispatch JSON and YAML through the same loader."""
+    return load_config(path, resolve_env=resolve_env)
 
 
 def stable_config_hash(config: dict[str, Any]) -> str:

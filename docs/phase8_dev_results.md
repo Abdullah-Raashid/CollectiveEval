@@ -63,9 +63,11 @@ The sixth still has a legitimate pre-call token rejection.
 
 ## Held-out Status
 
-Phase 9's local protocol is frozen, with five recipes across natural and matched-token
-conditions, and no ablations, second model or learned router. TEST remains unexecuted.
+This document is the preserved DEV analysis, not a held-out result. TEST execution
+has since completed under protocol v3: see [final held-out results](heldout_results.md)
+and [aggregate evidence](heldout_results.json). No ablations, second model or
+learned router were added. DEV numbers and their source JSON remain unchanged.
 The machine-specific protocol/raw evidence bundle is not included in this showcase.
 
-Protocol SHA-256:
+Original v1 protocol SHA-256 (historical DEV-to-TEST freeze):
 `e8fc45a7e772d24e6b8e422a1b51e09af07b74b58b950c06c08fb16e61571bce`.

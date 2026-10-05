@@ -60,6 +60,39 @@ def evaluate_run_report(
         "budget_event_counts": dict(Counter(event["event_type"] for event in budget_events)),
         "budget_events": budget_events,
         "attempt_accounting": attempt_accounting_report(store, run_id),
+        "component_coverage": component_coverage(store, run_id),
+    }
+
+
+def component_coverage(store: SQLiteStore, run_id: str) -> dict[str, Any]:
+    predictions = store._fetch_all(
+        "SELECT example_id,json_extract(metadata_json,'$.result_kind') AS result_kind "
+        "FROM predictions WHERE run_id=?",
+        (run_id,),
+    )
+    failed = sum(row["result_kind"] == "failed_prediction" for row in predictions)
+    rows = store._fetch_all(
+        "SELECT m.metric_name,COUNT(*) AS n_applicable,COUNT(m.metric_value) AS n_scored, "
+        "SUM(CASE WHEN json_extract(p.metadata_json,'$.result_kind')='failed_prediction' "
+        "THEN 1 ELSE 0 END) AS failed_output_count FROM metrics m JOIN predictions p "
+        "ON m.run_id=p.run_id AND m.example_id=p.example_id "
+        "WHERE m.run_id=? GROUP BY m.metric_name",
+        (run_id,),
+    )
+    return {
+        "n_total": len(predictions),
+        "failed_output_count": failed,
+        "components": {
+            row["metric_name"]: {
+                "n_total": len(predictions),
+                "n_scored": row["n_scored"],
+                "n_applicable": row["n_applicable"],
+                "failed_output_count": row["failed_output_count"],
+                "n_unavailable": row["n_applicable"] - row["n_scored"],
+                "n_not_applicable": len(predictions) - row["n_applicable"],
+            }
+            for row in rows
+        },
     }
 
 

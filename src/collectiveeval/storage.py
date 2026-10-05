@@ -8,7 +8,8 @@ from pathlib import Path
 from typing import Any
 
 from collectiveeval.budget import LogicalCallRecord, ModelCallRecord
-from collectiveeval.core import BenchmarkExample, StrategyResult
+from collectiveeval.core import BenchmarkExample
+from collectiveeval.failed_outputs import UNSCORABLE, FailedPrediction, PredictionResult
 
 SCHEMA = """
 PRAGMA foreign_keys = ON;
@@ -108,7 +109,8 @@ CREATE TABLE IF NOT EXISTS metrics (
   run_id TEXT NOT NULL,
   example_id TEXT,
   metric_name TEXT NOT NULL,
-  metric_value REAL NOT NULL,
+  metric_value REAL,
+  metric_status TEXT NOT NULL DEFAULT 'SCORED',
   FOREIGN KEY (run_id) REFERENCES runs(id)
 );
 CREATE UNIQUE INDEX IF NOT EXISTS prediction_checkpoint ON predictions(run_id, example_id);
@@ -136,7 +138,7 @@ CREATE TABLE IF NOT EXISTS failure_annotations (
   metadata_json TEXT NOT NULL,
   FOREIGN KEY (run_id) REFERENCES runs(id)
 );
-PRAGMA user_version = 2;
+PRAGMA user_version = 3;
 """
 
 
@@ -163,6 +165,11 @@ class SQLiteStore:
                     "Legacy scientific DB is immutable; use ReadOnlyPilotStore "
                     "for reading and a new DB for attempt accounting"
                 )
+            metric_columns = {
+                row["name"] for row in connection.execute("PRAGMA table_info(metrics)")
+            }
+            if metric_columns and "metric_status" not in metric_columns:
+                raise ValueError("Historical metric storage is immutable; use a separate v3 DB")
             connection.executescript(SCHEMA)
 
     def insert_experiment(
@@ -288,11 +295,11 @@ class SQLiteStore:
                 tuple(payload[k] for k in columns),
             )
 
-    def insert_prediction(self, result: StrategyResult) -> None:
+    def insert_prediction(self, result: PredictionResult) -> None:
         with self.connect() as connection:
             self._insert_prediction(connection, result)
 
-    def _insert_prediction(self, connection: sqlite3.Connection, result: StrategyResult) -> None:
+    def _insert_prediction(self, connection: sqlite3.Connection, result: PredictionResult) -> None:
         connection.execute(
             """
                 INSERT INTO predictions
@@ -303,7 +310,13 @@ class SQLiteStore:
                 result.metadata["run_id"],
                 result.example_id,
                 result.strategy,
-                json.dumps(result.output, ensure_ascii=False, sort_keys=True),
+                json.dumps(
+                    result.output.model_dump(mode="json")
+                    if isinstance(result, FailedPrediction)
+                    else result.output,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
                 result.confidence,
                 json.dumps(
                     {
@@ -348,15 +361,28 @@ class SQLiteStore:
         )
 
     def checkpoint_example(
-        self, result: StrategyResult, scores: dict[str, float], failures: list[dict[str, Any]]
+        self,
+        result: PredictionResult,
+        scores: dict[str, float | None],
+        failures: list[dict[str, Any]],
     ) -> None:
         """Prediction, metrics and annotations commit together; attempts are already durable."""
         run_id = result.metadata["run_id"]
         with self.connect() as connection:
             self._insert_prediction(connection, result)
             connection.executemany(
-                "INSERT INTO metrics (run_id,example_id,metric_name,metric_value) VALUES (?,?,?,?)",
-                [(run_id, result.example_id, name, float(value)) for name, value in scores.items()],
+                "INSERT INTO metrics (run_id,example_id,metric_name,metric_value,metric_status) "
+                "VALUES (?,?,?,?,?)",
+                [
+                    (
+                        run_id,
+                        result.example_id,
+                        name,
+                        value,
+                        UNSCORABLE if value is None else "SCORED",
+                    )
+                    for name, value in scores.items()
+                ],
             )
             connection.executemany(
                 "INSERT INTO failure_annotations "
@@ -373,6 +399,47 @@ class SQLiteStore:
                     )
                     for r in failures
                 ],
+            )
+
+    def evaluate_pending_failure(
+        self, result: FailedPrediction, scores: dict[str, float | None]
+    ) -> None:
+        """Evaluate a preserved failure only during explicitly authorized execution."""
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT output_json,metadata_json FROM predictions WHERE run_id=? AND example_id=?",
+                (result.metadata["run_id"], result.example_id),
+            ).fetchone()
+            if (
+                row is None
+                or json.loads(row["metadata_json"]).get("evaluation_status")
+                != ("PENDING_AUTHORIZED_EXECUTION")
+                or json.loads(row["output_json"]) != result.output.model_dump(mode="json")
+            ):
+                raise ValueError("Preserved failed prediction changed or already evaluated")
+            connection.executemany(
+                "INSERT INTO metrics (run_id,example_id,metric_name,metric_value,metric_status) "
+                "VALUES (?,?,?,?,?)",
+                [
+                    (
+                        result.metadata["run_id"],
+                        result.example_id,
+                        name,
+                        value,
+                        UNSCORABLE if value is None else "SCORED",
+                    )
+                    for name, value in scores.items()
+                ],
+            )
+            result.metadata["evaluation_status"] = "EVALUATED"
+            payload = {**result.metadata, "candidates": []}
+            connection.execute(
+                "UPDATE predictions SET metadata_json=? WHERE run_id=? AND example_id=?",
+                (
+                    json.dumps(payload, ensure_ascii=False, sort_keys=True),
+                    result.metadata["run_id"],
+                    result.example_id,
+                ),
             )
 
     def has_unknown_usage_for_config(self, config_hash: str) -> bool:
@@ -522,6 +589,7 @@ class SQLiteStore:
             SELECT example_id, metric_value
             FROM metrics
             WHERE run_id = ? AND metric_name = ? AND example_id IS NOT NULL
+            AND metric_value IS NOT NULL
             ORDER BY example_id
             """,
             (run_id, metric_name),

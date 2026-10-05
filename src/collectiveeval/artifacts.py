@@ -13,14 +13,14 @@ from typing import Any
 import yaml
 
 from collectiveeval.config import redact_secrets
-from collectiveeval.core import StrategyResult
+from collectiveeval.failed_outputs import PredictionResult
 
 
 def write_run_artifacts(
     *,
     artifact_dir: Path,
     config: dict[str, Any],
-    predictions: list[StrategyResult],
+    predictions: list[PredictionResult],
     metric_rows: list[dict[str, Any]],
     aggregate_metrics: dict[str, float],
     failure_rows: list[dict[str, Any]] | None = None,

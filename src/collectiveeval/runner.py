@@ -28,11 +28,20 @@ from collectiveeval.budget import (
 from collectiveeval.budget_policy import normalized_budget_config, resolve_budget_policy
 from collectiveeval.config import load_yaml_config, stable_config_hash
 from collectiveeval.context import StrategyContext
-from collectiveeval.core import BenchmarkExample, StrategyResult
+from collectiveeval.core import BenchmarkExample, ProviderErrorType, StrategyResult
 from collectiveeval.datasets import BENCHMARK_VERSION, file_sha256, load_jsonl
+from collectiveeval.failed_outputs import (
+    PENDING,
+    FailedOutput,
+    FailedPrediction,
+    PredictionResult,
+    evaluate_output,
+    failed_prediction,
+    failure_annotations,
+)
 from collectiveeval.failures import annotate_failures
-from collectiveeval.metrics import abstention_scores, derived_quality_metrics, score_prediction
-from collectiveeval.providers import build_provider_registry
+from collectiveeval.metrics import abstention_scores, derived_quality_metrics
+from collectiveeval.providers import ProviderError, build_provider_registry
 from collectiveeval.storage import SQLiteStore
 from collectiveeval.strategy_factory import strategy_from_config
 from collectiveeval.task_contracts import CONTRACT_VERSION
@@ -59,6 +68,7 @@ def run_experiment_from_path(
     max_examples: int | None = None,
     max_cost_usd: float | None = None,
     dry_run: bool = False,
+    failed_output_policy: bool = False,
 ) -> ExperimentRunResult | dict[str, Any]:
     config = load_yaml_config(config_path)
     if dry_run:
@@ -70,6 +80,7 @@ def run_experiment_from_path(
             output_dir=output_dir,
             max_examples=max_examples,
             max_cost_usd=max_cost_usd,
+            failed_output_policy=failed_output_policy,
         )
     )
 
@@ -107,6 +118,7 @@ async def run_experiment(
     output_dir: str | Path = "runs",
     max_examples: int | None = None,
     max_cost_usd: float | None = None,
+    failed_output_policy: bool = False,
 ) -> ExperimentRunResult:
     """Run one experiment config against a JSONL dataset with persisted outputs."""
 
@@ -177,7 +189,7 @@ async def run_experiment(
         start_ts=now,
     )
 
-    predictions: list[StrategyResult] = _prediction_rows_to_results(
+    predictions: list[PredictionResult] = _prediction_rows_to_results(
         store.get_run_predictions(run_id)
     )
     metric_rows: list[dict[str, Any]] = _example_metric_rows(store, run_id, strategy.name)
@@ -195,6 +207,28 @@ async def run_experiment(
     abstention_predicted: list[bool] = []
     abstention_expected: list[bool] = []
     try:
+        by_id = {example.id: example for example in examples}
+        for prediction in predictions:
+            if (
+                isinstance(prediction, FailedPrediction)
+                and prediction.metadata.get("evaluation_status") == PENDING
+            ):
+                if not failed_output_policy:
+                    raise ValueError("Failed-output evaluation requires explicit v3 policy")
+                scores = evaluate_output(by_id[prediction.example_id], prediction.output)
+                scores.update(_usage_scores(prediction))
+                scores.update(
+                    derived_quality_metrics(
+                        task_score=float(scores["task_score"] or 0),
+                        total_tokens=prediction.total_tokens,
+                        estimated_cost_usd=prediction.estimated_cost_usd,
+                        latency_ms=prediction.latency_ms,
+                    )
+                )
+                store.evaluate_pending_failure(prediction, scores)
+                metric_rows.append(
+                    {"example_id": prediction.example_id, "strategy": prediction.strategy, **scores}
+                )
         spent_cost = 0.0
         for example in examples:
             store.upsert_example(example)
@@ -214,6 +248,7 @@ async def run_experiment(
                 logical_call_sink=store.insert_logical_call,
             )
             started = time.perf_counter()
+            result: PredictionResult
             try:
                 previous_attempts = [
                     c for c in store.get_run_model_calls(run_id) if c["example_id"] == example.id
@@ -235,6 +270,11 @@ async def run_experiment(
             except BudgetExceeded as exc:
                 result = _budget_exhausted_result(example, strategy.name, ledger, str(exc))
                 budget_exhausted = str(exc)
+            except ProviderError as exc:
+                if not failed_output_policy or exc.error_type != ProviderErrorType.PARSE_ERROR:
+                    raise
+                result = failed_prediction(ledger, example.id, strategy.name)
+                budget_exhausted = None
             finally:
                 # Persist completed usage even when the strategy fails on parsing/provider errors.
                 for record in ledger.records:
@@ -258,8 +298,13 @@ async def run_experiment(
             )
             predictions.append(result)
 
-            scores = score_prediction(example, result.output)
-            if "predicted_abstain" in scores and "should_abstain" in scores:
+            scores = evaluate_output(example, result.output)
+            if isinstance(result, FailedPrediction):
+                result.metadata["evaluation_status"] = "EVALUATED"
+            if (
+                scores.get("predicted_abstain") is not None
+                and scores.get("should_abstain") is not None
+            ):
                 abstention_predicted.append(bool(scores["predicted_abstain"]))
                 abstention_expected.append(bool(scores["should_abstain"]))
             scores.update(
@@ -288,7 +333,7 @@ async def run_experiment(
             )
             scores.update(
                 derived_quality_metrics(
-                    task_score=scores["task_score"],
+                    task_score=float(scores["task_score"] or 0.0),
                     total_tokens=result.total_tokens,
                     estimated_cost_usd=result.estimated_cost_usd,
                     latency_ms=result.latency_ms,
@@ -296,8 +341,15 @@ async def run_experiment(
             )
             row = {"example_id": example.id, "strategy": result.strategy, **scores}
             metric_rows.append(row)
-            annotations = annotate_failures(example, result, scores)
+            annotations = (
+                []
+                if isinstance(result, FailedPrediction)
+                else annotate_failures(example, result, cast(dict[str, float], scores))
+            )
             checkpoint_failures = []
+            if isinstance(result, FailedPrediction):
+                checkpoint_failures.extend(failure_annotations(result))
+                failure_rows.extend(checkpoint_failures)
             for annotation in annotations:
                 row = {
                     "run_id": run_id,
@@ -422,17 +474,63 @@ def aggregate_numeric_metrics(rows: list[dict[str, Any]]) -> dict[str, float]:
     return {f"mean_{key}": sum(values) / len(values) for key, values in sorted(buckets.items())}
 
 
-def _prediction_rows_to_results(rows: list[dict[str, Any]]) -> list[StrategyResult]:
+def _usage_scores(result: PredictionResult) -> dict[str, float | None]:
+    scores = {
+        key: float(getattr(result, key))
+        for key in (
+            "input_tokens",
+            "output_tokens",
+            "total_tokens",
+            "model_calls",
+            "latency_ms",
+            "estimated_cost_usd",
+        )
+    }
+    scores["wall_clock_strategy_latency_ms"] = float(
+        result.metadata.get("wall_clock_strategy_latency_ms", result.latency_ms)
+    )
+    scores.update(
+        {
+            key: float(result.metadata[key])
+            for key in (
+                "logical_model_calls",
+                "provider_attempts",
+                "successful_attempts",
+                "failed_attempts",
+                "unknown_usage_attempts",
+                "known_token_lower_bound",
+                "logical_call_latency_ms",
+            )
+            if key in result.metadata
+        }
+    )
+    return dict(scores)
+
+
+def _prediction_rows_to_results(rows: list[dict[str, Any]]) -> list[PredictionResult]:
     results = []
     for row in rows:
         usage = json.loads(str(row["usage_json"]))
         metadata_payload = json.loads(str(row["metadata_json"]))
         candidates = metadata_payload.pop("candidates", [])
         results.append(
-            StrategyResult(
+            (
+                FailedPrediction
+                if metadata_payload.get("result_kind") == "failed_prediction"
+                else StrategyResult
+            )(
                 example_id=str(row["example_id"]),
                 strategy=str(row["strategy"]),
-                output=json.loads(str(row["output_json"])),
+                output=(
+                    FailedOutput.model_validate(json.loads(str(row["output_json"])))
+                    if metadata_payload.get("result_kind") == "failed_prediction"
+                    else json.loads(str(row["output_json"]))
+                ),
+                **(
+                    {"failed_outputs": metadata_payload.get("failed_outputs", [])}
+                    if metadata_payload.get("result_kind") == "failed_prediction"
+                    else {}
+                ),
                 confidence=float(row["confidence"]),
                 candidates=candidates,
                 model_calls=int(usage.get("model_calls", 0)),
@@ -465,7 +563,9 @@ def _example_metric_rows(
             str(example_id),
             {"example_id": str(example_id), "strategy": strategy_name},
         )
-        metric_row[str(row["metric_name"])] = float(row["metric_value"])
+        metric_row[str(row["metric_name"])] = (
+            None if row["metric_value"] is None else float(row["metric_value"])
+        )
     return [grouped[key] for key in sorted(grouped)]
 
 
@@ -475,7 +575,7 @@ def _abstention_pairs_from_rows(
     pairs = [
         (bool(row["predicted_abstain"]), bool(row["should_abstain"]))
         for row in rows
-        if "predicted_abstain" in row and "should_abstain" in row
+        if row.get("predicted_abstain") is not None and row.get("should_abstain") is not None
     ]
     if not pairs:
         return None

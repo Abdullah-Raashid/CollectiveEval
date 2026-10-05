@@ -14,6 +14,10 @@ from collectiveeval.validation import validate_output_schema
 class OutputParseError(ValueError):
     """Raised when provider text cannot be parsed into a task answer."""
 
+    def __init__(self, message: str, *, parsed_output: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.parsed_output = parsed_output
+
 
 @dataclass(frozen=True)
 class ParsedProviderOutput:
@@ -47,7 +51,11 @@ def parse_provider_output(
         status = ParseStatus.REPAIRED
         repaired = True
 
-    validate_task_output(example, parsed, task_contract)
+    try:
+        validate_task_output(example, parsed, task_contract)
+    except OutputParseError as exc:
+        exc.parsed_output = parsed
+        raise
     return ParsedProviderOutput(
         content=parsed,
         raw_output=raw_output,

@@ -13,7 +13,7 @@ from typing import Any
 
 from collectiveeval.budget import BUDGET_SEMANTICS_VERSION, SCIENTIFIC_ATTEMPT_POLICY
 from collectiveeval.budget_policy import resolve_budget_policy
-from collectiveeval.config import stable_config_hash
+from collectiveeval.config import load_config, stable_config_hash
 from collectiveeval.datasets import file_sha256
 from collectiveeval.failures import FailureType
 from collectiveeval.phase8_attempt_repair import REPAIRED, verify_preservation
@@ -38,10 +38,7 @@ TEMPERATURES = dict(zip(STRATEGIES, (0.2, 0.6, 0.2, 0.5, 0.2), strict=True))
 
 
 def read_json(path: Path) -> dict[str, Any]:
-    value = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(value, dict):
-        raise ValueError(f"Expected object: {path}")
-    return value
+    return load_config(path, resolve_env=False)
 
 
 def code_identity() -> dict[str, str]:
